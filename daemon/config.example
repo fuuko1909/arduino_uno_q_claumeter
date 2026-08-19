@@ -14,5 +14,10 @@ clock = auto
 chime = off
 
 # Internal serial bridge to the STM32U585 MCU.
+# Use /dev/ttyHS1 on the UNO Q.
+# For local testing on a PC, set serial_port = stdout to print payloads.
 serial_port = /dev/ttyHS1
 serial_baud = 115200
+
+# How often to poll Anthropic (seconds).
+poll_interval = 60

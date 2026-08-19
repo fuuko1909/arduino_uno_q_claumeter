@@ -18,6 +18,14 @@ clock = auto
 
 # Optional chime when a session limit resets
 chime = off
+
+# Serial port. On the UNO Q this is /dev/ttyHS1.
+# For local testing on a PC, set this to stdout to print JSON payloads.
+serial_port = /dev/ttyHS1
+serial_baud = 115200
+
+# How often to poll Anthropic (seconds)
+poll_interval = 60
 ```
 
 You must already be logged in with Claude Code in each config directory:
@@ -37,7 +45,27 @@ pip install -r requirements.txt
 python3 claude_usage_daemon.py
 ```
 
-## Install as systemd user service
+### Local test mode (no UNO Q required)
+
+Set `serial_port = stdout` in the config, then run:
+
+```bash
+python3 claude_usage_daemon.py --once
+```
+
+This prints one JSON payload to stdout so you can verify token reading and API polling without hardware.
+
+## Test scripts
+
+- `test_token.py` — verifies that a token can be extracted from the configured credentials file (token is never printed).
+- `test_multiaccount.py` — verifies the multi-account payload structure using mock credentials.
+
+```bash
+python3 test_token.py
+python3 test_multiaccount.py
+```
+
+## Install as systemd user service on the UNO Q
 
 ```bash
 ./install.sh

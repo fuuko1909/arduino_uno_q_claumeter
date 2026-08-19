@@ -1,25 +1,35 @@
 #!/usr/bin/env python3
 """Claude Usage Daemon for Arduino UNO Q (Linux MPU side).
 
-Polls the Anthropic API for one or more Claude accounts and streams a
-JSON payload to the STM32U585 MCU over the internal serial bridge
-(typically /dev/ttyHS1 at 115200 baud).
+Polls the Anthropic API for one or more Claude Code accounts in parallel and
+streams a compact JSON payload to the STM32U585 MCU over the internal serial
+bridge (typically /dev/ttyHS1 at 115200 baud).
+
+Can also run in local test mode by setting serial_port = "stdout" or
+"mock" in the config, which prints payloads instead of opening a serial port.
 """
 
 from __future__ import annotations
 
+import asyncio
 import calendar
 import datetime
 import json
 import os
 import re
+import signal
 import sys
 import time
 from pathlib import Path
 from typing import Any
 
 import httpx
-import serial
+
+# Optional import; only needed when serial_port is a real device.
+try:
+    import serial
+except Exception:  # pragma: no cover - serial may be missing in test envs
+    serial = None  # type: ignore
 
 CONFIG_FILE = Path.home() / ".config" / "claude-usage-monitor" / "config"
 DEFAULT_CONFIG_DIR = Path.home() / ".claude"
@@ -52,6 +62,7 @@ def read_config() -> dict[str, Any]:
         "chime": "off",
         "serial_port": "/dev/ttyHS1",
         "serial_baud": SERIAL_BAUD,
+        "poll_interval": POLL_INTERVAL,
     }
     if not CONFIG_FILE.exists():
         return cfg
@@ -82,12 +93,22 @@ def read_config() -> dict[str, Any]:
                     cfg["serial_baud"] = int(val)
                 except ValueError:
                     pass
+            elif key == "poll_interval":
+                try:
+                    cfg["poll_interval"] = int(val)
+                except ValueError:
+                    pass
     except OSError as e:
         log(f"Config read failed: {e}")
     return cfg
 
 
-def _extract_token(blob: str) -> str | None:
+def _extract_access_token(blob: str) -> str | None:
+    """Pull the accessToken out of a Claude credentials blob.
+
+    Mirrors the logic in Clawdmeter's BLE daemon: the file may contain a
+    bare token, a JSON object, or a nested object with multiple tokens.
+    """
     blob = blob.strip()
     if not blob:
         return None
@@ -112,28 +133,33 @@ def _extract_token(blob: str) -> str | None:
 def read_token(config_dir: Path) -> str | None:
     cred = config_dir / ".credentials.json"
     if not cred.exists():
+        log(f"No credentials file at {cred}")
         return None
     try:
-        return _extract_token(cred.read_text())
+        token = _extract_access_token(cred.read_text())
+        if token:
+            return token
+        log(f"Could not extract token from {cred}")
+        return None
     except OSError as e:
         log(f"Error reading {cred}: {e}")
         return None
 
 
-def reset_minutes(reset_ts: str, now: float) -> int:
+def _pct(util: str) -> int:
+    try:
+        return int(round(float(util) * 100))
+    except ValueError:
+        return 0
+
+
+def _reset_minutes(reset_ts: str, now: float) -> int:
     try:
         r = float(reset_ts)
     except ValueError:
         return 0
     mins = (r - now) / 60.0
     return int(round(mins)) if mins > 0 else 0
-
-
-def pct(util: str) -> int:
-    try:
-        return int(round(float(util) * 100))
-    except ValueError:
-        return 0
 
 
 def _billing_period_info(now: float, reset_ts: str) -> dict[str, Any]:
@@ -160,52 +186,59 @@ def _billing_period_info(now: float, reset_ts: str) -> dict[str, Any]:
     }
 
 
-def poll_account(token: str) -> dict[str, Any] | None:
+class TokenExpired(Exception):
+    """Raised when Anthropic returns 401/403."""
+
+
+async def poll_account(token: str, client: httpx.AsyncClient) -> dict[str, Any] | None:
+    """Poll Anthropic for a single account. Returns a payload dict or None."""
     headers = dict(API_HEADERS)
     headers["Authorization"] = f"Bearer {token}"
     try:
-        with httpx.Client(timeout=20.0) as client:
-            resp = client.post(API_URL, headers=headers, json=API_BODY)
+        resp = await client.post(API_URL, headers=headers, json=API_BODY)
     except httpx.HTTPError as e:
         log(f"API call failed: {e}")
         return None
 
     if resp.status_code in (401, 403):
         log(f"API HTTP {resp.status_code} (token expired/invalid)")
-        return {"ok": False, "error": "token_expired"}
+        raise TokenExpired()
     if resp.status_code >= 400:
         log(f"API HTTP {resp.status_code}: {resp.text[:200]}")
         return None
 
     now = time.time()
 
+    # Pro / Max accounts expose 5h/7d windows.
     if resp.headers.get("anthropic-ratelimit-unified-5h-utilization"):
         return {
             "ok": True,
-            "s": pct(resp.headers.get("anthropic-ratelimit-unified-5h-utilization", "0")),
-            "sr": reset_minutes(resp.headers.get("anthropic-ratelimit-unified-5h-reset", "0"), now),
-            "w": pct(resp.headers.get("anthropic-ratelimit-unified-7d-utilization", "0")),
-            "wr": reset_minutes(resp.headers.get("anthropic-ratelimit-unified-7d-reset", "0"), now),
+            "s": _pct(resp.headers.get("anthropic-ratelimit-unified-5h-utilization", "0")),
+            "sr": _reset_minutes(resp.headers.get("anthropic-ratelimit-unified-5h-reset", "0"), now),
+            "w": _pct(resp.headers.get("anthropic-ratelimit-unified-7d-utilization", "0")),
+            "wr": _reset_minutes(resp.headers.get("anthropic-ratelimit-unified-7d-reset", "0"), now),
             "st": resp.headers.get("anthropic-ratelimit-unified-5h-status", "unknown"),
             "acct": "pro",
         }
-    else:
-        reset_ts = resp.headers.get("anthropic-ratelimit-unified-overage-reset", "0")
-        return {
-            "ok": True,
-            "s": pct(resp.headers.get("anthropic-ratelimit-unified-overage-utilization", "0")),
-            "sr": reset_minutes(reset_ts, now),
-            "w": 0,
-            "wr": 0,
-            "st": resp.headers.get("anthropic-ratelimit-unified-status", "unknown"),
-            "acct": "ent",
-            **_billing_period_info(now, reset_ts),
-        }
+
+    # Enterprise / overage accounts use a single spending-limit window.
+    reset_ts = resp.headers.get("anthropic-ratelimit-unified-overage-reset", "0")
+    return {
+        "ok": True,
+        "s": _pct(resp.headers.get("anthropic-ratelimit-unified-overage-utilization", "0")),
+        "sr": _reset_minutes(reset_ts, now),
+        "w": 0,
+        "wr": 0,
+        "st": resp.headers.get("anthropic-ratelimit-unified-status", "unknown"),
+        "acct": "ent",
+        **_billing_period_info(now, reset_ts),
+    }
 
 
 def detect_hour_format() -> int:
     try:
         import locale
+
         locale.setlocale(locale.LC_TIME, "")
         fmt = locale.nl_langinfo(locale.T_FMT)
         if "%p" in fmt or "%r" in fmt or "%I" in fmt:
@@ -224,76 +257,182 @@ def add_clock_fields(payload: dict[str, Any], cfg: dict[str, Any]) -> None:
     payload["tf"] = tf
 
 
-def build_payload(cfg: dict[str, Any]) -> dict[str, Any]:
+async def poll_all_accounts(cfg: dict[str, Any]) -> dict[str, Any]:
+    """Poll every configured account and build the combined payload."""
     dirs = cfg.get("config_dirs", [DEFAULT_CONFIG_DIR])
     labels = cfg.get("labels", [])
+
+    tokens: dict[Path, str] = {}
+    for d in dirs:
+        token = read_token(d)
+        if token:
+            tokens[d] = token
+
+    if not tokens:
+        return {"ok": False, "error": "no_tokens"}
+
     accounts: list[dict[str, Any]] = []
     any_live = False
-    all_dead = True
 
-    for i, d in enumerate(dirs):
-        token = read_token(d)
-        if not token:
-            log(f"No token in {d}; skipping")
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        tasks = {d: poll_account(token, client) for d, token in tokens.items()}
+        results = await asyncio.gather(*tasks.values(), return_exceptions=True)
+
+    for idx, (d, result) in enumerate(zip(tasks.keys(), results)):
+        label = labels[idx] if idx < len(labels) else f"Account {idx + 1}"
+        if isinstance(result, TokenExpired):
+            accounts.append({"ok": False, "label": label, "error": "token_expired"})
+            any_live = True
             continue
-        any_live = True
-        result = poll_account(token)
+        if isinstance(result, Exception):
+            accounts.append({"ok": False, "label": label, "error": type(result).__name__})
+            continue
         if result is None:
-            all_dead = False  # transient failure, retry later
+            accounts.append({"ok": False, "label": label, "error": "poll_failed"})
             continue
-        if not result.get("ok"):
-            accounts.append({
-                "ok": False,
-                "label": labels[i] if i < len(labels) else f"Account {i + 1}",
-                "error": result.get("error", "unknown"),
-            })
-            all_dead = False
-            continue
-        result["label"] = labels[i] if i < len(labels) else f"Account {i + 1}"
+        result["label"] = label
         accounts.append(result)
+        any_live = True
 
-    payload: dict[str, Any] = {"ok": True, "accounts": accounts}
+    payload: dict[str, Any] = {"ok": any_live, "accounts": accounts}
     if cfg.get("chime") == "on":
         payload["c"] = 1
     add_clock_fields(payload, cfg)
     return payload
 
 
-def main() -> int:
-    cfg = read_config()
-    port = cfg.get("serial_port", "/dev/ttyHS1")
-    baud = int(cfg.get("serial_baud", SERIAL_BAUD))
-    log(f"=== UNO Q Claude Usage Daemon ===")
-    log(f"Serial: {port} @ {baud}")
-    log(f"Config dirs: {cfg.get('config_dirs')}")
+class Transport:
+    """Abstraction over serial, stdout, or mock output."""
 
-    try:
-        ser = serial.Serial(port, baud, timeout=1)
-    except serial.SerialException as e:
-        log(f"Cannot open serial port {port}: {e}")
-        return 1
+    def __init__(self, cfg: dict[str, Any]) -> None:
+        self.port = cfg.get("serial_port", "/dev/ttyHS1")
+        self.baud = int(cfg.get("serial_baud", SERIAL_BAUD))
+        self._ser: Any | None = None
+        self.refresh_event = asyncio.Event()
 
-    last_poll = 0.0
-    try:
-        while True:
-            now = time.time()
-            if now - last_poll >= POLL_INTERVAL:
-                payload = build_payload(cfg)
-                line = json.dumps(payload, separators=(",", ":")) + "\n"
-                log(f"Sending {len(line)} bytes")
+    def open(self) -> bool:
+        if self.port in ("stdout", "-", "mock"):
+            log(f"Output mode: {self.port}")
+            return True
+        if serial is None:
+            log("pyserial not installed; cannot open real serial port")
+            return False
+        try:
+            self._ser = serial.Serial(self.port, self.baud, timeout=1)
+            log(f"Opened {self.port} @ {self.baud}")
+            return True
+        except serial.SerialException as e:
+            log(f"Cannot open serial port {self.port}: {e}")
+            return False
+
+    def write(self, line: bytes) -> bool:
+        if self.port in ("stdout", "-"):
+            sys.stdout.buffer.write(line)
+            sys.stdout.buffer.flush()
+            return True
+        if self.port == "mock":
+            return True
+        if self._ser is None:
+            return False
+        try:
+            self._ser.write(line)
+            return True
+        except serial.SerialException as e:
+            log(f"Serial write failed: {e}")
+            self._ser = None
+            return False
+
+    def start_reader(self) -> None:
+        """Start a background thread reading refresh commands from the MCU."""
+        if self.port in ("stdout", "-", "mock") or self._ser is None:
+            return
+        import threading
+
+        def reader():
+            buf = ""
+            while self._ser is not None:
                 try:
-                    ser.write(line.encode())
-                except serial.SerialException as e:
-                    log(f"Serial write failed: {e}")
-                last_poll = now
+                    data = self._ser.read(self._ser.in_waiting or 1)
+                except serial.SerialException:
+                    break
+                if not data:
+                    continue
+                buf += data.decode("utf-8", errors="ignore")
+                while "\n" in buf:
+                    line, buf = buf.split("\n", 1)
+                    if '"cmd"' in line and '"refresh"' in line:
+                        log("Refresh requested by MCU")
+                        self.refresh_event.set()
 
-            time.sleep(1.0)
-    except KeyboardInterrupt:
-        pass
+        threading.Thread(target=reader, daemon=True).start()
+
+    def close(self) -> None:
+        if self._ser is not None:
+            try:
+                self._ser.close()
+            except Exception:
+                pass
+            self._ser = None
+
+
+async def main(once: bool = False) -> int:
+    cfg = read_config()
+    poll_interval = int(cfg.get("poll_interval", POLL_INTERVAL))
+
+    log("=== UNO Q Claude Usage Daemon ===")
+    log(f"Poll interval: {poll_interval}s")
+    log(f"Config dirs: {[str(d) for d in cfg.get('config_dirs', [DEFAULT_CONFIG_DIR])]}")
+
+    transport = Transport(cfg)
+    if not transport.open():
+        return 1
+    transport.start_reader()
+
+    stop_event = asyncio.Event()
+
+    def _stop(*_args: Any) -> None:
+        log("Stopping")
+        stop_event.set()
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        asyncio.get_running_loop().add_signal_handler(sig, _stop)
+
+    try:
+        while not stop_event.is_set():
+            payload = await poll_all_accounts(cfg)
+            line = json.dumps(payload, separators=(",", ":")) + "\n"
+            log(f"Sending {len(line)} bytes: {line.strip()[:200]}")
+            ok = transport.write(line.encode())
+            if not ok:
+                log("Transport write failed; will retry connection next cycle")
+                transport.close()
+                if not transport.open():
+                    log("Reconnection failed, sleeping")
+
+            if once:
+                break
+
+            try:
+                # Wake early if the MCU requests a refresh.
+                done, pending = await asyncio.wait(
+                    {stop_event.wait(), transport.refresh_event.wait()},
+                    timeout=poll_interval,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                for fut in pending:
+                    fut.cancel()
+                transport.refresh_event.clear()
+            except asyncio.TimeoutError:
+                pass
     finally:
-        ser.close()
+        transport.close()
+
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    once = "--once" in sys.argv
+    try:
+        sys.exit(asyncio.run(main(once=once)))
+    except KeyboardInterrupt:
+        sys.exit(0)
