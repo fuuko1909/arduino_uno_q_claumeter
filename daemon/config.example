@@ -1,0 +1,18 @@
+# Example daemon configuration for the UNO Q Linux side.
+# Copy to ~/.config/claude-usage-monitor/config and edit for your accounts.
+
+# Comma-separated Claude config dirs, each containing a .credentials.json file.
+config_dirs = /home/arduino/.claude,/home/arduino/.claude-work
+
+# Labels shown on the device for each account, in the same order.
+labels = Personal,Work
+
+# Clock display: off | auto | 12 | 24
+clock = auto
+
+# Play a chime on the device when a session limit resets: off | on
+chime = off
+
+# Internal serial bridge to the STM32U585 MCU.
+serial_port = /dev/ttyHS1
+serial_baud = 115200
