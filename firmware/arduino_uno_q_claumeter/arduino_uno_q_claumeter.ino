@@ -30,18 +30,23 @@ void loop() {
         display_draw_ui(accounts);
     }
 
+    static unsigned long last_touch_ms = 0;
+    const unsigned long TOUCH_DEBOUNCE_MS = 500;
+
     int tx, ty;
     if (touch_read(&tx, &ty)) {
-        Serial.print("Touch: ");
-        Serial.print(tx);
-        Serial.print(",");
-        Serial.println(ty);
+        unsigned long now = millis();
+        if (now - last_touch_ms >= TOUCH_DEBOUNCE_MS) {
+            last_touch_ms = now;
+            Serial.print("Touch: ");
+            Serial.print(tx);
+            Serial.print(",");
+            Serial.println(ty);
 
-        // Tap upper half = request refresh from daemon.
-        if (ty < SCREEN_H / 2) {
+            // Any tap requests a fresh poll from the Linux daemon.
+            // The daemon always polls every configured account.
             transport_request_refresh();
         }
-        // Tap lower half could switch to a status view later.
     }
 
     delay(10);

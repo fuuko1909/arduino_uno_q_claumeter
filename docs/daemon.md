@@ -65,6 +65,36 @@ python3 test_token.py
 python3 test_multiaccount.py
 ```
 
+## Payload format and refresh command
+
+Each poll the daemon sends one compact JSON line to the MCU:
+
+```json
+{"ok":true,"accounts":[{"label":"Personal","acct":"pro","s":42,"sr":95,"w":18,"wr":5000,"st":"allowed"},...]}
+```
+
+Fields per account:
+
+| Field | Meaning |
+|-------|---------|
+| `ok` | `true` if this account was polled successfully |
+| `label` | Display name from `labels` config |
+| `acct` | `pro` or `ent` |
+| `s` | 5-hour (Pro) or overage (Enterprise) utilization % |
+| `sr` | Minutes until the short window resets |
+| `w` | 7-day utilization % (Pro) |
+| `wr` | Minutes until the weekly window resets (Pro) |
+| `st` | Rate-limit status, e.g. `allowed` / `limited` |
+| `error` | Short error code when `ok` is `false` |
+
+The MCU can ask for an immediate re-poll by sending:
+
+```json
+{"cmd":"refresh"}
+```
+
+This is triggered by tapping the screen in the main sketch.
+
 ## Install as systemd user service on the UNO Q
 
 ```bash

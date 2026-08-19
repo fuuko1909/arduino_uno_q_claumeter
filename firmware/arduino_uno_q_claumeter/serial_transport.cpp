@@ -26,13 +26,16 @@ bool transport_check(AccountData accounts[2]) {
                     int idx = 0;
                     for (JsonObject acct : arr) {
                         if (idx >= 2) break;
+                        bool acct_ok = acct["ok"] | true;
                         safe_strlcpy(accounts[idx].label, acct["label"] | "Account", sizeof(accounts[idx].label));
+                        safe_strlcpy(accounts[idx].account_type, acct["acct"] | "", sizeof(accounts[idx].account_type));
                         accounts[idx].session_pct = acct["s"] | 0;
                         accounts[idx].session_reset_mins = acct["sr"] | -1;
                         accounts[idx].weekly_pct = acct["w"] | 0;
                         accounts[idx].weekly_reset_mins = acct["wr"] | -1;
                         safe_strlcpy(accounts[idx].status, acct["st"] | "unknown", sizeof(accounts[idx].status));
-                        accounts[idx].valid = true;
+                        safe_strlcpy(accounts[idx].error, acct["error"] | "", sizeof(accounts[idx].error));
+                        accounts[idx].valid = acct_ok;
                         idx++;
                     }
                     // Mark any remaining slot invalid if not present.

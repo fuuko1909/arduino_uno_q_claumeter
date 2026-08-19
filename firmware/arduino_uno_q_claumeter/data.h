@@ -3,11 +3,13 @@
 
 struct AccountData {
     char label[16];
+    char account_type[8];   // "pro" / "ent"
     int session_pct;
     int session_reset_mins;
     int weekly_pct;
     int weekly_reset_mins;
     char status[16];
+    char error[16];         // non-empty when ok == false
     bool valid;
 };
 

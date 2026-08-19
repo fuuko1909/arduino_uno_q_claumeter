@@ -51,6 +51,29 @@ arduino-cli upload --fqbn arduino:zephyr:unoq -p /dev/ttyACM0 .
 
 If you see upload errors, verify that the UNO Q is in bootloader/upload mode and that the Linux side is running the expected bridge services.
 
+## Bring-up test
+
+Before loading the main firmware, flash `firmware/tft_bringup_test` to verify wiring, display colors and touch raw coordinates:
+
+```bash
+cd firmware/tft_bringup_test
+arduino-cli compile --fqbn arduino:zephyr:unoq .
+arduino-cli upload --fqbn arduino:zephyr:unoq -p /dev/ttyACM0 .
+```
+
+The screen should cycle red/green/blue and print raw XPT2046 values over USB serial when you touch it. Use those values to tune `TOUCH_X_MIN/MAX` and `TOUCH_Y_MIN/MAX` in `config.h` if the mapped cursor is off.
+
+## Test the MCU firmware without Claude tokens
+
+You can feed fake two-account payloads to the running main firmware from a PC or from the UNO Q MPU:
+
+```bash
+cd daemon
+.venv/bin/python mock_sender.py /dev/ttyACM0   # or the internal /dev/ttyHS1 on the UNO Q
+```
+
+The main sketch parses the JSON and redraws the side-by-side panels each time a new line arrives.
+
 ## Serial monitor
 
 ```bash
